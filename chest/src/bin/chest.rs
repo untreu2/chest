@@ -66,23 +66,30 @@ struct DbEvent {
     ref_event: Option<String>,
 }
 
-/// Connects to a relay URL, subscribes to Nostr events, and stores received events in the database.
-async fn listen_to_relay(
+/// Opens a connection and subscribes to only a specific event kind.
+/// A separate WebSocket connection is created for each relay–event kind pair.
+async fn listen_to_relay_for_kind(
     relay_url: &str,
-    allowed_event_kinds: &[u64],
+    event_kind: u64,
     db_pool: SqlitePool,
 ) -> Result<(), Box<dyn Error>> {
     let url = Url::parse(relay_url)?;
     let (ws_stream, _response) = connect_async(url).await?;
-    println!("Connected to relay: {}", relay_url);
+    println!(
+        "Connected to relay: {} for event kind: {}",
+        relay_url, event_kind
+    );
 
     let (mut write, mut read) = ws_stream.split();
     let subscription_id = Uuid::new_v4().to_string();
 
-    // Send subscription request
-    let req_message = serde_json::json!(["REQ", subscription_id, { "kinds": allowed_event_kinds }]);
+    // Subscription request: filtering for a single event kind.
+    let req_message = serde_json::json!(["REQ", subscription_id, { "kinds": [event_kind] }]);
     write.send(Message::Text(req_message.to_string())).await?;
-    println!("Subscription sent to relay {}.", relay_url);
+    println!(
+        "Subscription sent to relay {} for kind {}.",
+        relay_url, event_kind
+    );
 
     while let Some(message) = read.next().await {
         let message = message?;
@@ -90,105 +97,101 @@ async fn listen_to_relay(
             let text = message.into_text()?;
             let value: Value = serde_json::from_str(&text)?;
             if let Some(arr) = value.as_array() {
+                // Relay message format: ["EVENT", subscription_id, event_obj]
                 if arr.len() >= 3 && arr[0] == "EVENT" {
                     let event_obj = &arr[2];
                     let event: NostrEvent = serde_json::from_value(event_obj.clone())?;
+                    // Since the subscription already filters by event kind, no additional check is required.
 
-                    // Process only allowed event kinds
-                    if allowed_event_kinds.contains(&event.kind) {
-                        println!(
-                            "Received event kind {} (ID: {}) from relay {}",
-                            event.kind, event.id, relay_url
-                        );
+                    println!(
+                        "Received event kind {} (ID: {}) from relay {}",
+                        event.kind, event.id, relay_url
+                    );
 
-                        // Determine storage folder and referenced event (if applicable).
-                        let (folder, ref_event) = match event.kind {
-                            0 => ("users".to_string(), None), // User metadata
-                            1 => {
-                                // Note events may contain a reference via tag "e".
-                                if let Some(tag) = event
-                                    .tags
-                                    .iter()
-                                    .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
-                                {
-                                    if let Some(ref_event_id) = tag.get(1) {
-                                        ("replies".to_string(), Some(ref_event_id.clone()))
-                                    } else {
-                                        ("notes".to_string(), None)
-                                    }
+                    // Determine storage folder and referenced event based on event kind.
+                    let (folder, ref_event) = match event.kind {
+                        0 => ("users".to_string(), None), // User metadata
+                        1 => {
+                            // Note events: may contain an "e" tag as reference.
+                            if let Some(tag) = event
+                                .tags
+                                .iter()
+                                .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
+                            {
+                                if let Some(ref_event_id) = tag.get(1) {
+                                    ("replies".to_string(), Some(ref_event_id.clone()))
                                 } else {
                                     ("notes".to_string(), None)
                                 }
+                            } else {
+                                ("notes".to_string(), None)
                             }
-                            7 => {
-                                // Reaction events require an "e" tag.
-                                if let Some(tag) = event
-                                    .tags
-                                    .iter()
-                                    .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
-                                {
-                                    if let Some(ref_event_id) = tag.get(1) {
-                                        ("reactions".to_string(), Some(ref_event_id.clone()))
-                                    } else {
-                                        eprintln!(
-                                            "Reaction event {} missing 'e' tag value.",
-                                            event.id
-                                        );
-                                        continue;
-                                    }
+                        }
+                        7 => {
+                            // Reaction events: must contain an "e" tag.
+                            if let Some(tag) = event
+                                .tags
+                                .iter()
+                                .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
+                            {
+                                if let Some(ref_event_id) = tag.get(1) {
+                                    ("reactions".to_string(), Some(ref_event_id.clone()))
                                 } else {
-                                    eprintln!("Reaction event {} has no 'e' tag.", event.id);
+                                    eprintln!("Reaction event {} missing 'e' tag value.", event.id);
                                     continue;
                                 }
+                            } else {
+                                eprintln!("Reaction event {} has no 'e' tag.", event.id);
+                                continue;
                             }
-                            9734 | 9735 => {
-                                // Zap events (optional referenced event)
-                                let ref_ev = event
-                                    .tags
-                                    .iter()
-                                    .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
-                                    .and_then(|tag| tag.get(1).cloned());
-                                ("zaps".to_string(), ref_ev)
-                            }
-                            30023 | 30024 => ("long".to_string(), None), // Long-form events
-                            _ => continue,                               // Ignore other event kinds
-                        };
-
-                        // Convert to DbEvent structure
-                        let db_event = DbEvent {
-                            event_id: event.id.clone(),
-                            pubkey: event.pubkey.clone(),
-                            created_at: event.created_at as i64,
-                            kind: event.kind as i64,
-                            content: event.content.clone(),
-                            sig: event.sig.clone(),
-                            tags: serde_json::to_string(&event.tags)?,
-                            folder,
-                            ref_event,
-                        };
-
-                        // Insert event using "INSERT OR IGNORE" to avoid duplicates.
-                        let query = r#"
-                            INSERT OR IGNORE INTO events (
-                                event_id, pubkey, created_at, kind, content, sig, tags, folder, ref_event
-                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                        "#;
-                        match sqlx::query(query)
-                            .bind(&db_event.event_id)
-                            .bind(&db_event.pubkey)
-                            .bind(db_event.created_at)
-                            .bind(db_event.kind)
-                            .bind(&db_event.content)
-                            .bind(&db_event.sig)
-                            .bind(&db_event.tags)
-                            .bind(&db_event.folder)
-                            .bind(&db_event.ref_event)
-                            .execute(&db_pool)
-                            .await
-                        {
-                            Ok(_) => println!("Event {} saved to database.", event.id),
-                            Err(e) => eprintln!("Error inserting event {}: {:?}", event.id, e),
                         }
+                        9734 | 9735 => {
+                            // Zap events
+                            let ref_ev = event
+                                .tags
+                                .iter()
+                                .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
+                                .and_then(|tag| tag.get(1).cloned());
+                            ("zaps".to_string(), ref_ev)
+                        }
+                        30023 | 30024 => ("long".to_string(), None), // Long-form events
+                        _ => continue,                               // Ignore other event types.
+                    };
+
+                    // Convert to DbEvent structure.
+                    let db_event = DbEvent {
+                        event_id: event.id.clone(),
+                        pubkey: event.pubkey.clone(),
+                        created_at: event.created_at as i64,
+                        kind: event.kind as i64,
+                        content: event.content.clone(),
+                        sig: event.sig.clone(),
+                        tags: serde_json::to_string(&event.tags)?,
+                        folder,
+                        ref_event,
+                    };
+
+                    // Insert event using "INSERT OR IGNORE" to prevent duplicates.
+                    let query = r#"
+                        INSERT OR IGNORE INTO events (
+                            event_id, pubkey, created_at, kind, content, sig, tags, folder, ref_event
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    "#;
+                    match sqlx::query(query)
+                        .bind(&db_event.event_id)
+                        .bind(&db_event.pubkey)
+                        .bind(db_event.created_at)
+                        .bind(db_event.kind)
+                        .bind(&db_event.content)
+                        .bind(&db_event.sig)
+                        .bind(&db_event.tags)
+                        .bind(&db_event.folder)
+                        .bind(&db_event.ref_event)
+                        .execute(&db_pool)
+                        .await
+                    {
+                        Ok(_) => println!("Event {} saved to database.", event.id),
+                        Err(e) => eprintln!("Error inserting event {}: {:?}", event.id, e),
                     }
                 }
             }
@@ -244,7 +247,7 @@ async fn list_folder_events(
 ) -> impl Responder {
     let (folder, ref_event) = path.into_inner();
 
-    // Only allow folder listings for replies, reactions, and zaps.
+    // Only allowed folder listings for replies, reactions, and zaps.
     let allowed_folders = ["replies", "reactions", "zaps"];
     if !allowed_folders.contains(&folder.as_str()) {
         return HttpResponse::BadRequest().body("Invalid folder name");
@@ -311,7 +314,7 @@ async fn list_notes_by_pubkey(
 /// Main entry point of the application.
 /// 1. Loads configuration.
 /// 2. Creates a SQLite connection pool and ensures the events table exists.
-/// 3. Spawns tasks for each relay connection.
+/// 3. Spawns tasks for each relay–event kind combination.
 /// 4. Starts the HTTP server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -349,16 +352,22 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
-    // Spawn a task for each relay URL.
+    // Spawn a task for each relay URL and for each event kind.
     for relay_url in config.relays.urls.clone() {
-        let db_pool_clone = db_pool.clone();
-        let event_kinds = config.event.kinds.clone();
-        let relay_url_clone = relay_url.clone();
-        tokio::spawn(async move {
-            if let Err(e) = listen_to_relay(&relay_url_clone, &event_kinds, db_pool_clone).await {
-                eprintln!("Error on relay {}: {}", relay_url_clone, e);
-            }
-        });
+        for event_kind in config.event.kinds.clone() {
+            let db_pool_clone = db_pool.clone();
+            let relay_url_clone = relay_url.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    listen_to_relay_for_kind(&relay_url_clone, event_kind, db_pool_clone).await
+                {
+                    eprintln!(
+                        "Error on relay {} for kind {}: {}",
+                        relay_url_clone, event_kind, e
+                    );
+                }
+            });
+        }
     }
 
     // Share configuration and database pool with HTTP server.
