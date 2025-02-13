@@ -232,11 +232,6 @@ async fn get_note_event(id: web::Path<String>, db_pool: web::Data<SqlitePool>) -
     query_event("notes", id.into_inner(), db_pool.get_ref()).await
 }
 
-/// HTTP endpoint to retrieve a zap event.
-async fn get_zap_event(id: web::Path<String>, db_pool: web::Data<SqlitePool>) -> impl Responder {
-    query_event("zaps", id.into_inner(), db_pool.get_ref()).await
-}
-
 /// HTTP endpoint to retrieve a long-form event.
 async fn get_long_event(id: web::Path<String>, db_pool: web::Data<SqlitePool>) -> impl Responder {
     query_event("long", id.into_inner(), db_pool.get_ref()).await
@@ -286,16 +281,6 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .add_source(config::File::with_name("config"))
         .build()?;
     settings.try_deserialize::<AppConfig>()
-}
-
-/// Handler for querying a single event from a folder using two URL parameters.
-/// For example: GET /replies/{ref_event}/{id}
-async fn get_event_from_folder(
-    path: web::Path<(String, String)>,
-    db_pool: web::Data<SqlitePool>,
-) -> impl Responder {
-    let (folder, identifier) = path.into_inner();
-    query_event(&folder, identifier, db_pool.get_ref()).await
 }
 
 /// Lists all note events for a specific user based on their pubkey.
@@ -387,24 +372,11 @@ async fn main() -> std::io::Result<()> {
             // Single event endpoints
             .route("/users/{id}", web::get().to(get_user_event))
             .route("/notes/{id}", web::get().to(get_note_event))
-            .route("/zaps/{id}", web::get().to(get_zap_event))
             .route("/long/{id}", web::get().to(get_long_event))
-            // Folder listing endpoints (e.g., /replies/{ref_event} and /replies/{ref_event}/{id})
+            // Folder listing endpoints
             .route("/replies/{ref_event}", web::get().to(list_folder_events))
-            .route(
-                "/replies/{ref_event}/{id}",
-                web::get().to(get_event_from_folder),
-            )
             .route("/reactions/{ref_event}", web::get().to(list_folder_events))
-            .route(
-                "/reactions/{ref_event}/{id}",
-                web::get().to(get_event_from_folder),
-            )
             .route("/zaps/{ref_event}", web::get().to(list_folder_events))
-            .route(
-                "/zaps/{ref_event}/{id}",
-                web::get().to(get_event_from_folder),
-            )
             // List all notes for a specific user by pubkey.
             .route(
                 "/notes/pubkey/{pubkey}",
