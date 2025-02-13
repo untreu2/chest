@@ -43,6 +43,15 @@ curl -X GET http://127.0.0.1:8080/notes/{hex_id}
 **Response:**
 Returns the stored note event if found.
 
+### Get Notes for a spesific user
+
+**Request:**
+```bash
+curl -X GET http://127.0.0.1:8080/notes/pubkey/{pubkey_hex_id}
+```
+**Response:**
+Returns the stored note events for a spesific user if found.
+
 ### Get a Zap Event
 **Request:**
 ```bash
@@ -54,7 +63,7 @@ Returns the stored zap event if found.
 ### Get a Long-form Event
 **Request:**
 ```bash
-curl -X GET http://127.0.0.1:8080/long/hex_id}
+curl -X GET http://127.0.0.1:8080/long/{hex_id}
 ```
 **Response:**
 Returns the stored long-form event if found.

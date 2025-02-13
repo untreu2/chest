@@ -121,7 +121,7 @@ async fn listen_to_relay(
                                 }
                             }
                             7 => {
-                                // Reaction events require an "e" tag
+                                // Reaction events require an "e" tag.
                                 if let Some(tag) = event
                                     .tags
                                     .iter()
@@ -298,6 +298,31 @@ async fn get_event_from_folder(
     query_event(&folder, identifier, db_pool.get_ref()).await
 }
 
+/// Lists all note events for a specific user based on their pubkey.
+async fn list_notes_by_pubkey(
+    path: web::Path<String>,
+    db_pool: web::Data<SqlitePool>,
+) -> impl Responder {
+    let pubkey = path.into_inner();
+    let query = r#"
+        SELECT event_id, pubkey, created_at, kind, content, sig, tags, folder, ref_event
+        FROM events
+        WHERE folder = 'notes' AND pubkey = ?
+    "#;
+
+    match sqlx::query_as::<_, DbEvent>(query)
+        .bind(&pubkey)
+        .fetch_all(db_pool.get_ref())
+        .await
+    {
+        Ok(events) => HttpResponse::Ok().json(events),
+        Err(e) => {
+            eprintln!("Database query error: {:?}", e);
+            HttpResponse::InternalServerError().body("Internal error")
+        }
+    }
+}
+
 /// Main entry point of the application.
 /// 1. Loads configuration.
 /// 2. Creates a SQLite connection pool and ensures the events table exists.
@@ -379,6 +404,11 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/zaps/{ref_event}/{id}",
                 web::get().to(get_event_from_folder),
+            )
+            // List all notes for a specific user by pubkey.
+            .route(
+                "/notes/pubkey/{pubkey}",
+                web::get().to(list_notes_by_pubkey),
             )
             // Configuration endpoint
             .route("/config", web::get().to(get_config))
