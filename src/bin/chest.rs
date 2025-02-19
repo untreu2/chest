@@ -4,8 +4,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::error::Error;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream};
 use url::Url;
 use uuid::Uuid;
 
@@ -35,7 +37,7 @@ struct EventConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct DatabaseConfig {
-    /// Path to the SQLite database file (default: "events.db" in chest/chest)
+    /// Path to the SQLite database file (default: chest/events.db)
     path: String,
 }
 
@@ -52,7 +54,6 @@ pub struct NostrEvent {
 }
 
 /// Database record structure for events
-/// The `tags` field is stored as a JSON string
 #[derive(sqlx::FromRow, Debug, Clone, Serialize)]
 struct DbEvent {
     event_id: String,
@@ -66,368 +67,106 @@ struct DbEvent {
     ref_event: Option<String>,
 }
 
-/// Opens a connection and subscribes to only a specific event kind.
-/// A separate WebSocket connection is created for each relay–event kind pair.
-async fn listen_to_relay_for_kind(
-    relay_url: &str,
-    event_kind: u64,
-    db_pool: SqlitePool,
-) -> Result<(), Box<dyn Error>> {
-    let url = Url::parse(relay_url)?;
-    let (ws_stream, _response) = connect_async(url).await?;
-    println!(
-        "Connected to relay: {} for event kind: {}",
-        relay_url, event_kind
-    );
-
-    let (mut write, mut read) = ws_stream.split();
-    let subscription_id = Uuid::new_v4().to_string();
-
-    // Subscription request: filtering for a single event kind.
-    let req_message = serde_json::json!(["REQ", subscription_id, { "kinds": [event_kind] }]);
-    write.send(Message::Text(req_message.to_string())).await?;
-    println!(
-        "Subscription sent to relay {} for kind {}.",
-        relay_url, event_kind
-    );
-
-    while let Some(message) = read.next().await {
-        let message = message?;
-        if message.is_text() {
-            let text = message.into_text()?;
-            let value: Value = serde_json::from_str(&text)?;
-            if let Some(arr) = value.as_array() {
-                // Relay message format: ["EVENT", subscription_id, event_obj]
-                if arr.len() >= 3 && arr[0] == "EVENT" {
-                    let event_obj = &arr[2];
-                    let event: NostrEvent = serde_json::from_value(event_obj.clone())?;
-                    // Since the subscription already filters by event kind, no additional check is required.
-
-                    println!(
-                        "Received event kind {} (ID: {}) from relay {}",
-                        event.kind, event.id, relay_url
-                    );
-
-                    // Determine storage folder and referenced event based on event kind.
-                    let (folder, ref_event) = match event.kind {
-                        0 => ("users".to_string(), None), // User metadata
-                        1 => {
-                            // Note events: may contain an "e" tag as reference.
-                            if let Some(tag) = event
-                                .tags
-                                .iter()
-                                .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
-                            {
-                                if let Some(ref_event_id) = tag.get(1) {
-                                    ("replies".to_string(), Some(ref_event_id.clone()))
-                                } else {
-                                    ("notes".to_string(), None)
-                                }
-                            } else {
-                                ("notes".to_string(), None)
-                            }
-                        }
-                        7 => {
-                            // Reaction events: must contain an "e" tag.
-                            if let Some(tag) = event
-                                .tags
-                                .iter()
-                                .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
-                            {
-                                if let Some(ref_event_id) = tag.get(1) {
-                                    ("reactions".to_string(), Some(ref_event_id.clone()))
-                                } else {
-                                    eprintln!("Reaction event {} missing 'e' tag value.", event.id);
-                                    continue;
-                                }
-                            } else {
-                                eprintln!("Reaction event {} has no 'e' tag.", event.id);
-                                continue;
-                            }
-                        }
-                        9734 | 9735 => {
-                            // Zap events
-                            let ref_ev = event
-                                .tags
-                                .iter()
-                                .find(|t| t.get(0).map(|s| s == "e").unwrap_or(false))
-                                .and_then(|tag| tag.get(1).cloned());
-                            ("zaps".to_string(), ref_ev)
-                        }
-                        30023 | 30024 => ("long".to_string(), None), // Long-form events
-                        _ => continue,                               // Ignore other event types.
-                    };
-
-                    // Convert to DbEvent structure.
-                    let db_event = DbEvent {
-                        event_id: event.id.clone(),
-                        pubkey: event.pubkey.clone(),
-                        created_at: event.created_at as i64,
-                        kind: event.kind as i64,
-                        content: event.content.clone(),
-                        sig: event.sig.clone(),
-                        tags: serde_json::to_string(&event.tags)?,
-                        folder,
-                        ref_event: ref_event.clone(),
-                    };
-
-                    // Insert event using "INSERT OR IGNORE" to prevent duplicates.
-                    let query = r#"
-                        INSERT OR IGNORE INTO events (
-                            event_id, pubkey, created_at, kind, content, sig, tags, folder, ref_event
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    "#;
-                    match sqlx::query(query)
-                        .bind(&db_event.event_id)
-                        .bind(&db_event.pubkey)
-                        .bind(db_event.created_at)
-                        .bind(db_event.kind)
-                        .bind(&db_event.content)
-                        .bind(&db_event.sig)
-                        .bind(&db_event.tags)
-                        .bind(&db_event.folder)
-                        .bind(&db_event.ref_event)
-                        .execute(&db_pool)
-                        .await
-                    {
-                        Ok(_) => println!("Event {} saved to database.", event.id),
-                        Err(e) => eprintln!("Error inserting event {}: {:?}", event.id, e),
-                    }
-
-                    // Dynamic subscription: If the event is a note (kind 1) and it has not been subscribed to yet,
-                    // spawn a new subscription task to listen for reaction, zap, and reply events for this note.
-                    if event.kind == 1 {
-                        let note_event_id = event.id.clone();
-                        let relay_url_clone = relay_url.to_string();
-                        let db_pool_clone = db_pool.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = dynamic_listen_to_relay_for_note(
-                                &relay_url_clone,
-                                note_event_id,
-                                db_pool_clone,
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "Error in dynamic subscription on relay {}: {}",
-                                    relay_url_clone, e
-                                );
-                            }
-                        });
-                    }
-
-                    // Dynamic subscription: If the event is a long-form event (kind 30023 or 30024),
-                    // spawn a new subscription task to listen for reaction, zap, and reply events for this long content.
-                    if event.kind == 30023 || event.kind == 30024 {
-                        let long_event_id = event.id.clone();
-                        let relay_url_clone = relay_url.to_string();
-                        let db_pool_clone = db_pool.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = dynamic_listen_to_relay_for_long(
-                                &relay_url_clone,
-                                long_event_id,
-                                db_pool_clone,
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "Error in dynamic subscription on relay {}: {}",
-                                    relay_url_clone, e
-                                );
-                            }
-                        });
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+/// WebSocket connection holder
+#[derive(Debug)]
+struct WSConnection {
+    write: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+        Message,
+    >,
+    read: Option<
+        futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+        >,
+    >,
 }
 
-/// Dynamic subscription function that connects to a relay and listens for reaction, zap,
-/// and reply events that reference a given note event ID.
-async fn dynamic_listen_to_relay_for_note(
-    relay_url: &str,
-    note_event_id: String,
-    db_pool: SqlitePool,
-) -> Result<(), Box<dyn Error>> {
-    let url = Url::parse(relay_url)?;
-    let (ws_stream, _response) = connect_async(url).await?;
-    println!(
-        "Dynamic subscription started on relay {} for note ID {}",
-        relay_url, note_event_id
-    );
-
-    let (mut write, mut read) = ws_stream.split();
-    let subscription_id = Uuid::new_v4().to_string();
-
-    // Subscription request: filter for reaction (7) and zap (9734, 9735) events referencing the note.
-    let req_message = serde_json::json!([
-        "REQ",
-        subscription_id,
-        { "kinds": [7, 9734, 9735], "#e": [note_event_id] }
-    ]);
-    write.send(Message::Text(req_message.to_string())).await?;
-    println!(
-        "Dynamic subscription request sent to relay {} for note ID {}.",
-        relay_url, note_event_id
-    );
-
-    while let Some(message) = read.next().await {
-        let message = message?;
-        if message.is_text() {
-            let text = message.into_text()?;
-            let value: Value = serde_json::from_str(&text)?;
-            if let Some(arr) = value.as_array() {
-                // Relay message format: ["EVENT", subscription_id, event_obj]
-                if arr.len() >= 3 && arr[0] == "EVENT" {
-                    let event_obj = &arr[2];
-                    let event: NostrEvent = serde_json::from_value(event_obj.clone())?;
-                    println!(
-                        "Dynamic subscription received event kind {} (ID: {}) from relay {}",
-                        event.kind, event.id, relay_url
-                    );
-
-                    // Determine storage folder based on event kind.
-                    let folder = match event.kind {
-                        7 => "reactions".to_string(),
-                        9734 | 9735 => "zaps".to_string(),
-                        _ => continue, // Ignore other event types.
-                    };
-
-                    // For dynamic subscriptions we assume the reference event is the note_event_id.
-                    let db_event = DbEvent {
-                        event_id: event.id.clone(),
-                        pubkey: event.pubkey.clone(),
-                        created_at: event.created_at as i64,
-                        kind: event.kind as i64,
-                        content: event.content.clone(),
-                        sig: event.sig.clone(),
-                        tags: serde_json::to_string(&event.tags)?,
-                        folder,
-                        ref_event: Some(note_event_id.clone()),
-                    };
-
-                    // Insert event using "INSERT OR IGNORE" to prevent duplicates.
-                    let query = r#"
-                        INSERT OR IGNORE INTO events (
-                            event_id, pubkey, created_at, kind, content, sig, tags, folder, ref_event
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    "#;
-                    match sqlx::query(query)
-                        .bind(&db_event.event_id)
-                        .bind(&db_event.pubkey)
-                        .bind(db_event.created_at)
-                        .bind(db_event.kind)
-                        .bind(&db_event.content)
-                        .bind(&db_event.sig)
-                        .bind(&db_event.tags)
-                        .bind(&db_event.folder)
-                        .bind(&db_event.ref_event)
-                        .execute(&db_pool)
-                        .await
-                    {
-                        Ok(_) => println!("Dynamic event {} saved to database.", event.id),
-                        Err(e) => eprintln!("Error inserting dynamic event {}: {:?}", event.id, e),
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+/// Manages a single WebSocket connection per relay
+#[derive(Debug)]
+struct WebSocketManager {
+    connections: HashMap<String, WSConnection>,
 }
 
-/// Dynamic subscription function that connects to a relay and listens for reaction, zap,
-/// and reply events that reference a given long-form event ID.
-async fn dynamic_listen_to_relay_for_long(
-    relay_url: &str,
-    long_event_id: String,
-    db_pool: SqlitePool,
-) -> Result<(), Box<dyn Error>> {
-    let url = Url::parse(relay_url)?;
-    let (ws_stream, _response) = connect_async(url).await?;
-    println!(
-        "Dynamic subscription started on relay {} for long content ID {}",
-        relay_url, long_event_id
-    );
+impl WebSocketManager {
+    /// Creates a new manager and attempts to connect to all provided relay URLs
+    async fn new(relay_urls: &[String]) -> Self {
+        let mut connections = HashMap::new();
+        for relay_url in relay_urls {
+            if let Ok(conn) = Self::connect(relay_url).await {
+                connections.insert(relay_url.clone(), conn);
+                println!("Connected to relay: {}", relay_url);
+            } else {
+                eprintln!("Failed to connect to relay: {}", relay_url);
+            }
+        }
+        Self { connections }
+    }
 
-    let (mut write, mut read) = ws_stream.split();
-    let subscription_id = Uuid::new_v4().to_string();
+    /// Establishes a WebSocket connection to a single relay
+    async fn connect(relay_url: &str) -> Result<WSConnection, Box<dyn Error>> {
+        let url = Url::parse(relay_url)?;
+        let (ws_stream, _) = connect_async(url).await?;
+        let (write, read) = ws_stream.split();
+        Ok(WSConnection {
+            write,
+            read: Some(read),
+        })
+    }
 
-    // Subscription request: filter for reaction (7) and zap (9734, 9735) events referencing the long content.
-    let req_message = serde_json::json!([
-        "REQ",
-        subscription_id,
-        { "kinds": [7, 9734, 9735], "#e": [long_event_id] }
-    ]);
-    write.send(Message::Text(req_message.to_string())).await?;
-    println!(
-        "Dynamic subscription request sent to relay {} for long content ID {}.",
-        relay_url, long_event_id
-    );
+    /// Sends a subscription REQ to a relay, if connected
+    async fn add_subscription(
+        &mut self,
+        relay_url: &str,
+        req_message: Value,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(conn) = self.connections.get_mut(relay_url) {
+            conn.write
+                .send(Message::Text(req_message.to_string()))
+                .await?;
+            println!(
+                "Subscription added on relay: {} with request: {}",
+                relay_url, req_message
+            );
+        } else {
+            eprintln!("No connection found for relay: {}", relay_url);
+        }
+        Ok(())
+    }
 
-    while let Some(message) = read.next().await {
-        let message = message?;
-        if message.is_text() {
-            let text = message.into_text()?;
-            let value: Value = serde_json::from_str(&text)?;
-            if let Some(arr) = value.as_array() {
-                // Relay message format: ["EVENT", subscription_id, event_obj]
-                if arr.len() >= 3 && arr[0] == "EVENT" {
-                    let event_obj = &arr[2];
-                    let event: NostrEvent = serde_json::from_value(event_obj.clone())?;
-                    println!(
-                        "Dynamic subscription received event kind {} (ID: {}) from relay {}",
-                        event.kind, event.id, relay_url
-                    );
-
-                    // Determine storage folder based on event kind.
-                    let folder = match event.kind {
-                        7 => "reactions".to_string(),
-                        9734 | 9735 => "zaps".to_string(),
-                        _ => continue, // Ignore other event types.
-                    };
-
-                    // For dynamic subscriptions we assume the reference event is the long_event_id.
-                    let db_event = DbEvent {
-                        event_id: event.id.clone(),
-                        pubkey: event.pubkey.clone(),
-                        created_at: event.created_at as i64,
-                        kind: event.kind as i64,
-                        content: event.content.clone(),
-                        sig: event.sig.clone(),
-                        tags: serde_json::to_string(&event.tags)?,
-                        folder,
-                        ref_event: Some(long_event_id.clone()),
-                    };
-
-                    // Insert event using "INSERT OR IGNORE" to prevent duplicates.
-                    let query = r#"
-                        INSERT OR IGNORE INTO events (
-                            event_id, pubkey, created_at, kind, content, sig, tags, folder, ref_event
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    "#;
-                    match sqlx::query(query)
-                        .bind(&db_event.event_id)
-                        .bind(&db_event.pubkey)
-                        .bind(db_event.created_at)
-                        .bind(db_event.kind)
-                        .bind(&db_event.content)
-                        .bind(&db_event.sig)
-                        .bind(&db_event.tags)
-                        .bind(&db_event.folder)
-                        .bind(&db_event.ref_event)
-                        .execute(&db_pool)
-                        .await
-                    {
-                        Ok(_) => println!("Dynamic event {} saved to database.", event.id),
-                        Err(e) => eprintln!("Error inserting dynamic event {}: {:?}", event.id, e),
+    /// Listens to messages from all relay connections
+    async fn listen(&mut self) {
+        for (relay_url, conn) in self.connections.iter_mut() {
+            if let Some(mut read) = conn.read.take() {
+                let relay_url = relay_url.clone();
+                tokio::spawn(async move {
+                    while let Some(message) = read.next().await {
+                        match message {
+                            Ok(Message::Text(text)) => {
+                                println!("Message received from {}: {}", relay_url, text);
+                            }
+                            Ok(Message::Close(_)) => {
+                                println!("Connection closed for relay: {}", relay_url);
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("Error receiving message from {}: {}", relay_url, e);
+                                break;
+                            }
+                            _ => {}
+                        }
                     }
-                }
+                });
             }
         }
     }
-    Ok(())
+}
+
+/// Loads configuration from `config.toml`
+fn load_config() -> Result<AppConfig, ConfigError> {
+    let settings = config::Config::builder()
+        .add_source(config::File::with_name("config"))
+        .build()?;
+    settings.try_deserialize::<AppConfig>()
 }
 
 /// Query a single event from the database based on folder and identifier.
@@ -508,14 +247,6 @@ async fn get_config(config: web::Data<AppConfig>) -> impl Responder {
     HttpResponse::Ok().json(config.get_ref())
 }
 
-/// Loads configuration from `config.toml`
-fn load_config() -> Result<AppConfig, ConfigError> {
-    let settings = config::Config::builder()
-        .add_source(config::File::with_name("config"))
-        .build()?;
-    settings.try_deserialize::<AppConfig>()
-}
-
 /// Lists all note events for a specific user based on their pubkey.
 async fn list_notes_by_pubkey(
     path: web::Path<String>,
@@ -544,7 +275,7 @@ async fn list_notes_by_pubkey(
 /// Main entry point of the application.
 /// 1. Loads configuration.
 /// 2. Creates a SQLite connection pool and ensures the events table exists.
-/// 3. Spawns tasks for each relay–event kind combination.
+/// 3. Subscribes to certain event kinds on all relays.
 /// 4. Starts the HTTP server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -582,28 +313,31 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
-    // Global subscriptions: only subscribe for note events (kind 1) and long-form events (30023, 30024).
+    // Event kinds we want to subscribe to globally:
     let global_event_kinds = vec![1, 30023, 30024];
 
-    // Spawn a task for each relay URL and for each global event kind.
-    for relay_url in config.relays.urls.clone() {
-        for event_kind in global_event_kinds.clone() {
-            let db_pool_clone = db_pool.clone();
-            let relay_url_clone = relay_url.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    listen_to_relay_for_kind(&relay_url_clone, event_kind, db_pool_clone).await
-                {
-                    eprintln!(
-                        "Error on relay {} for kind {}: {}",
-                        relay_url_clone, event_kind, e
-                    );
-                }
-            });
+    // Create a WebSocketManager for all relays.
+    let mut ws_manager = WebSocketManager::new(&config.relays.urls).await;
+
+    // Add subscriptions for each relay for each global event kind.
+    for relay_url in &config.relays.urls {
+        for event_kind in &global_event_kinds {
+            let subscription_id = Uuid::new_v4().to_string();
+            let req_message =
+                serde_json::json!(["REQ", subscription_id, { "kinds": [event_kind] }]);
+            if let Err(e) = ws_manager.add_subscription(relay_url, req_message).await {
+                eprintln!(
+                    "Error adding subscription on relay {} for kind {}: {}",
+                    relay_url, event_kind, e
+                );
+            }
         }
     }
 
-    // Share configuration and database pool with HTTP server.
+    // Start listening to messages on all WebSocket connections.
+    ws_manager.listen().await;
+
+    // Share configuration and database pool with the HTTP server.
     let config_data = web::Data::new(config.clone());
     let db_pool_data = web::Data::new(db_pool);
 
